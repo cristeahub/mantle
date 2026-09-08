@@ -1,5 +1,7 @@
 # Mantle
 
+![Mantle: one core, many states](assets/mantle.png)
+
 Switch between work and private Codex homes in Bash or Zsh, then keep running ordinary `codex`.
 
 ```text
@@ -24,11 +26,18 @@ The installer is an OCaml script, following Monty's default `~/.local` prefix an
 It uses `dune install` to install the standalone executable at `PREFIX/bin/mantle` and prints shell setup instructions.
 Run it again to upgrade; a failed build leaves the installed CLI untouched.
 The installed CLI works independently of this checkout.
-Installation does not edit shell startup files or create Codex profiles.
+After installation, it detects Bash or Zsh from `$SHELL` and asks before adding PATH, shell integration, and the prompt segment to your startup files.
+Only `y` or `yes` agrees; Enter, EOF, and other answers leave those files untouched.
+For another shell, run `SHELL=/bin/bash ./install` or `SHELL=/bin/zsh ./install`.
+Zsh setup uses `$ZDOTDIR/.zshrc` when `ZDOTDIR` is exported and nonempty, otherwise `~/.zshrc`.
+Bash setup uses `~/.bashrc` and the first existing login file (`~/.bash_profile`, `~/.bash_login`, or `~/.profile`), creating `~/.bash_profile` if none exists.
+Setup preserves existing content, permissions, and dotfile symlinks; repeated installs update a single marked block.
+Open a new terminal after accepting setup.
+Installation does not create Codex profiles.
 
 Ensure `~/.local/bin` and your usual Codex executable are on `PATH`.
-Run the appropriate integration below and add it to your own shell startup file if desired.
-For Bash login shells, ensure your login startup file sources `~/.bashrc`.
+If you skip automatic setup, run the appropriate integration below and add it to your own shell startup file if desired.
+For manual Bash setup, ensure your login startup file sources `~/.bashrc`.
 
 Bash (`~/.bashrc`):
 
@@ -142,7 +151,7 @@ dune runtest
 
 The installer, integration runner, and fake Codex are OCaml, using temporary homes and both shells.
 The native `script` utility supplies the Bash terminal test.
-Checks cover installation/upgrades, failed builds, arguments/cwd, concurrent shells, running and inherited children, restoration, quoting, permissions, failures, and prompt rendering/width.
+Checks cover installation/upgrades, consent and repeated shell setup, failed builds, arguments/cwd, concurrent shells, running and inherited children, restoration, quoting, permissions, failures, and prompt rendering/width.
 
 On 2026-09-08, installed `codex-cli 0.153.4` on macOS connected ordinary interactive invocations to separate temporary home-local control sockets.
 The native daemon diagnostic hit the Unix socket length limit (104 bytes for the requested private-home socket under `/Users/christoffer`), while ordinary startup with an even longer home reached ChatGPT login.

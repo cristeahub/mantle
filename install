@@ -2,8 +2,93 @@
 #directory "+unix";;
 #load "unix.cma";;
 
-let usage = "Usage: ./install [--prefix DIR]\nInstall the mantle CLI with Dune. Default prefix: $HOME/.local\n"
+let usage = "Usage: ./install [--prefix DIR]\nInstall the mantle CLI with Dune. Default prefix: $HOME/.local\nAsk before setting up Bash or Zsh startup files (default: no).\n"
 let quote value = "'" ^ String.concat "'\\''" (String.split_on_char '\'' value) ^ "'"
+let caller_dir = Sys.getcwd ()
+let absolute path = if Filename.is_relative path then Filename.concat caller_dir path else path
+let home () = match Sys.getenv_opt "HOME" with
+  | Some path when path <> "" && not (Filename.is_relative path) -> path
+  | _ -> failwith "HOME must be an absolute directory"
+
+let read path =
+  let channel = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in channel) (fun () -> really_input_string channel (in_channel_length channel))
+
+let prepare_setup block path =
+  (* Follow dotfile symlinks so updates keep the user's dotfile layout intact. *)
+  let target = try ignore (Unix.lstat path); Unix.realpath path
+    with Unix.Unix_error (Unix.ENOENT, "lstat", _) -> path in
+  let contents, mode =
+    try
+      let stat = Unix.stat target in
+      if stat.Unix.st_kind <> Unix.S_REG || stat.Unix.st_nlink <> 1 || stat.Unix.st_uid <> Unix.getuid () then
+        failwith ("expected an owned regular startup file: " ^ target);
+      read target, stat.Unix.st_perm
+    with Unix.Unix_error (Unix.ENOENT, "stat", _) -> "", 0o600
+  in
+  let first = "# >>> mantle >>>" and last = "# <<< mantle <<<" in
+  let lines = String.split_on_char '\n' contents in
+  let count marker = List.length (List.filter (( = ) marker) lines) in
+  if count first <> count last || count first > 1 then failwith ("invalid Mantle setup markers in " ^ path);
+  let block = first :: String.split_on_char '\n' block @ [last] in
+  let rec replace = function
+    | [] -> block @ [""]
+    | line :: rest when line = first -> block @ after rest
+    | line :: _ when line = last -> failwith ("invalid Mantle setup markers in " ^ path)
+    | line :: rest -> line :: replace rest
+  and after = function
+    | [] -> failwith ("unfinished Mantle setup block in " ^ path)
+    | line :: rest when line = last -> rest
+    | _ :: rest -> after rest
+  in
+  target, mode, String.concat "\n" (replace lines)
+
+let write_setup (target, mode, contents) =
+  let temporary, channel = Filename.open_temp_file ~temp_dir:(Filename.dirname target) ".mantle-" ".tmp" in
+  Fun.protect ~finally:(fun () ->
+    close_out_noerr channel;
+    if Sys.file_exists temporary then Unix.unlink temporary) (fun () ->
+    output_string channel contents;
+    close_out channel;
+    Unix.chmod temporary mode;
+    Unix.rename temporary target)
+
+let setup_shell bin =
+  let shell = Filename.basename (Option.value (Sys.getenv_opt "SHELL") ~default:"") in
+  if List.mem shell ["bash"; "zsh"] then (
+    let user_dir = home () in
+    let files = if shell = "zsh" then
+        let directory = match Sys.getenv_opt "ZDOTDIR" with Some path when path <> "" -> absolute path | _ -> user_dir in
+        [Filename.concat directory ".zshrc"]
+      else
+        let profiles = List.map (Filename.concat user_dir) [".bash_profile"; ".bash_login"; ".profile"] in
+        [Filename.concat user_dir ".bashrc";
+         Option.value (List.find_opt Sys.file_exists profiles) ~default:(List.hd profiles)]
+    in
+    Printf.printf "\nAdd Mantle commands and prompt to %s?\n  %s\n[y/N] %!" shell (String.concat "\n  " files);
+    let answer = try String.lowercase_ascii (String.trim (read_line ())) with End_of_file -> "" in
+    if List.mem answer ["y"; "yes"] then (
+      let block = Printf.sprintf {|if [ -n "${%s_VERSION-}" ]; then
+  case $- in
+    *i*)
+      case ":${PATH-}:" in
+        *:%s:*) ;;
+        *) export PATH=%s:"${PATH-}" ;;
+      esac
+      eval "$(%s init %s)"
+      %s
+      case "${PS1-}" in
+        *'$(mantle prompt)'*) ;;
+        *) PS1='$(mantle prompt) '"${PS1-}" ;;
+      esac
+      ;;
+  esac
+fi|} (String.uppercase_ascii shell) (quote bin) (quote bin) (quote (Filename.concat bin "mantle")) shell
+        (if shell = "bash" then "shopt -s promptvars" else "setopt PROMPT_SUBST") in
+      let updates = List.map (prepare_setup block) files in
+      List.iter write_setup updates;
+      print_endline "Shell setup saved. Open a new terminal to use Mantle.")
+    else print_endline "Shell setup skipped.")
 
 let run arguments =
   let pid = Unix.create_process "dune" (Array.of_list ("dune" :: arguments)) Unix.stdin Unix.stdout Unix.stderr in
@@ -15,15 +100,12 @@ let run arguments =
 let () =
   try
     let prefix = match List.tl (Array.to_list Sys.argv) with
-      | [] ->
-        (match Sys.getenv_opt "HOME" with
-         | Some home when home <> "" && not (Filename.is_relative home) -> Filename.concat home ".local"
-         | _ -> failwith "HOME must be an absolute directory, or use --prefix DIR")
+      | [] -> Filename.concat (home ()) ".local"
       | ["--prefix"; path] when path <> "" && path.[0] <> '-' -> path
       | ["--help"] | ["-h"] -> print_string usage; exit 0
       | _ -> prerr_string usage; exit 2
     in
-    let prefix = if Filename.is_relative prefix then Filename.concat (Sys.getcwd ()) prefix else prefix in
+    let prefix = absolute prefix in
     Unix.chdir (Filename.dirname (Unix.realpath Sys.argv.(0)));
     run ["build"; "--root"; "."; "@install"];
     run ["install"; "--root"; "."; "--prefix"; prefix; "--sections"; "bin"; "--destdir"; "/"];
@@ -32,7 +114,8 @@ let () =
     let path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
     if not (List.mem bin (String.split_on_char ':' path)) then
       Printf.printf "Add to PATH:\n  export PATH=%s:\"$PATH\"\n" (quote bin);
-    print_endline "Activate in Bash: eval \"$(mantle init bash)\"\nActivate in Zsh:  eval \"$(mantle init zsh)\""
+    print_endline "Activate in Bash: eval \"$(mantle init bash)\"\nActivate in Zsh:  eval \"$(mantle init zsh)\"";
+    setup_shell bin
   with
   | Failure message | Sys_error message -> Printf.eprintf "install: %s\n" message; exit 1
   | Unix.Unix_error (error, operation, path) ->

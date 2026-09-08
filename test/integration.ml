@@ -361,12 +361,16 @@ let check_install root =
   List.iter mkdir [checkout; user_dir];
   List.iter (fun name -> copy (Filename.dirname source / name) (checkout / name))
     ["install"; "mantle.ml"; "dune"; "dune-project"];
-  List.iter (fun name -> write (user_dir / name) "keep shell setup\n") [".bashrc"; ".zshrc"];
-  let env = ["HOME", user_dir; "TERM", "dumb"; "DUNE_CACHE", "disabled";
+  let existing_setup = "PS1='project (main) > '\n" in
+  List.iter (fun name -> write (user_dir / name) existing_setup; Unix.chmod (user_dir / name) 0o640) [".bashrc"; ".zshrc"];
+  let env = ["HOME", user_dir; "SHELL", "/bin/bash"; "TERM", "dumb"; "DUNE_CACHE", "disabled";
              "DESTDIR", root / "unused staging";
              "PATH", String.concat ":" [Filename.dirname Sys.argv.(2); Filename.dirname Sys.argv.(3); "/usr/bin"; "/bin"]] in
-  let run ?(expected = 0) args =
-    finish ~expected "installer" (start ~root ~env ~cwd:root (checkout / "install" :: args)) in
+  let run ?(expected = 0) ?(extra = []) ?(answer = "") args =
+    let input_path = root / "installer-answer" in
+    write input_path answer;
+    let input = Unix.openfile input_path [Unix.O_RDONLY] 0 in
+    finish ~expected "installer" (start ~root ~env:(replace env extra) ~cwd:root ~input (checkout / "install" :: args)) in
   ignore (run ["--help"]);
   List.iter (fun args -> ignore (run ~expected:2 args)) [["--prefix"]; ["--prefix"; ""]; ["--unknown"]];
   assert (not (Sys.file_exists (checkout / "_build")));
@@ -383,15 +387,78 @@ let check_install root =
   write binary "old CLI";
   ignore (run ["--prefix"; prefix]);
   assert (read binary = original);
-  write (checkout / "mantle.ml") "intentionally invalid OCaml\n";
-  ignore (run ~expected:1 ["--prefix"; prefix]);
-  assert (read binary = original && read default_binary = original);
-  assert (not (Sys.file_exists (root / "unused staging")));
+  ignore (run ~answer:"n\n" ["--prefix"; prefix]);
+  List.iter (fun name -> assert (read (user_dir / name) = existing_setup)) [".bashrc"; ".zshrc"];
+  assert (not (Sys.file_exists (user_dir / ".bash_profile")));
+
+  (* Consent adds one replaceable block; Bash works for login and non-login terminals. *)
+  List.iter (fun shell ->
+    let extra = ["SHELL", shell] in
+    let names = if Filename.basename shell = "bash" then [".bashrc"; ".bash_profile"] else [".zshrc"] in
+    let files = List.map (Filename.concat user_dir) names in
+    ignore (run ~extra ~answer:"YES\n" ["--prefix"; prefix]);
+    List.iter (fun file -> write file (read file ^ "# Keep user edits after Mantle too.\n")) files;
+    let saved = List.map read files in
+    assert (String.starts_with ~prefix:existing_setup (List.hd saved));
+    assert ((Unix.stat (List.hd files)).Unix.st_perm = 0o640);
+    ignore (run ~extra ~answer:"y\n" ["--prefix"; prefix]);
+    assert (List.map read files = saved);
+    ignore (run ~extra ~answer:"yes\n" []);
+    assert (not (contains (read (List.hd files)) binary_dir));
+    ignore (run ~extra ~answer:"yes\n" ["--prefix"; prefix]);
+    assert (List.map read files = saved)) shells;
+  assert ((Unix.stat (user_dir / ".bash_profile")).Unix.st_perm = 0o600);
   assert (not (Sys.file_exists (user_dir / ".local/share/mantle")));
-  List.iter (fun name -> assert (read (user_dir / name) = "keep shell setup\n")) [".bashrc"; ".zshrc"];
+
+  let shell_check shell options script =
+    finish "installed shell startup" (start ~root ~env:(replace env ["SHELL", shell]) ~cwd:root
+      (shell :: options @ ["-i"; "-c"; {|
+mantle work
+test "$(mantle prompt)" = '(work)' || exit 1
+case "$PS1" in
+  '$(mantle prompt) '*'$(mantle prompt)'*) exit 2 ;;
+  '$(mantle prompt) '*) ;;
+  *) exit 3 ;;
+esac
+|} ^ script ^ "\nmantle off"])) in
+  List.iter (fun shell -> ignore (shell_check shell [] {|test "$PS1" = '$(mantle prompt) project (main) > ' || exit 4|})) shells;
+  ignore (shell_check "/bin/bash" ["-l"] "");
+
+  (* A malformed existing block aborts before changing any startup file. *)
+  let bashrc = user_dir / ".bashrc" and profile = user_dir / ".bash_profile" in
+  let saved_rc = read bashrc and saved_profile = read profile in
+  write profile (saved_profile ^ "# >>> mantle >>>\n");
+  ignore (run ~expected:1 ~answer:"yes\n" []);
+  assert (read bashrc = saved_rc && read profile = saved_profile ^ "# >>> mantle >>>\n");
+  write profile saved_profile;
+
+  (* Respect existing Bash login profiles, ZDOTDIR, and symlinked dotfiles. *)
+  Unix.rename profile (user_dir / ".profile");
+  ignore (run ~answer:"yes\n" ["--prefix"; prefix]);
+  assert (not (Sys.file_exists profile));
+  assert (read (user_dir / ".profile") = saved_profile);
+  let zdotdir = root / "zsh config ' $x" in
+  mkdir zdotdir;
+  let target = root / "linked-zshrc" in
+  write target existing_setup;
+  Unix.chmod target 0o640;
+  Unix.symlink target (zdotdir / ".zshrc");
+  let previous_zshrc = read (user_dir / ".zshrc") in
+  ignore (run ~extra:["SHELL", "/bin/zsh"; "ZDOTDIR", Filename.basename zdotdir] ~answer:"yes\n" ["--prefix"; prefix]);
+  assert ((Unix.lstat (zdotdir / ".zshrc")).Unix.st_kind = Unix.S_LNK);
+  assert ((Unix.stat target).Unix.st_perm = 0o640 && contains (read target) "# >>> mantle >>>");
+  assert (read (user_dir / ".zshrc") = previous_zshrc);
+  ignore (finish "ZDOTDIR startup" (start ~root ~env:(replace env ["ZDOTDIR", zdotdir]) ~cwd:root
+    ["/bin/zsh"; "-i"; "-c"; "mantle work && test \"$(mantle prompt)\" = '(work)' && mantle off"]));
+
+  write (checkout / "mantle.ml") "intentionally invalid OCaml\n";
+  ignore (run ~expected:1 ~answer:"yes\n" ["--prefix"; prefix]);
+  assert (read binary = original && read default_binary = original);
+  assert (read bashrc = saved_rc && read (user_dir / ".profile") = saved_profile);
+  assert (not (Sys.file_exists (root / "unused staging")));
   (* All shell checks below use this installed CLI after its source checkout is removed. *)
   remove checkout;
-  print_endline "installer: default/custom prefixes, upgrades, failed builds, independent executable passed";
+  print_endline "installer: prefixes, upgrades, failed builds, consent, idempotent Bash/Zsh startup passed";
   binary_dir, binary
 
 let main () =
