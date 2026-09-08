@@ -1,4 +1,4 @@
-# Mantle
+# mantle
 
 ![Mantle: one core, many states](assets/mantle.png)
 
@@ -59,9 +59,9 @@ Initialization defines shell functions without selecting a context or changing `
 
 ## Select and log in
 
-| Command | Selected `CODEX_HOME` |
-| --- | --- |
-| `mantle work` | `~/.local/share/mantle/profiles/work/codex/` |
+| Command          | Selected `CODEX_HOME`                           |
+| ---------------- | ----------------------------------------------- |
+| `mantle work`    | `~/.local/share/mantle/profiles/work/codex/`    |
 | `mantle private` | `~/.local/share/mantle/profiles/private/codex/` |
 
 Log in once per context:
