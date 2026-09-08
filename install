@@ -1,0 +1,39 @@
+#!/usr/bin/env ocaml
+#directory "+unix";;
+#load "unix.cma";;
+
+let usage = "Usage: ./install [--prefix DIR]\nInstall the mantle CLI with Dune. Default prefix: $HOME/.local\n"
+let quote value = "'" ^ String.concat "'\\''" (String.split_on_char '\'' value) ^ "'"
+
+let run arguments =
+  let pid = Unix.create_process "dune" (Array.of_list ("dune" :: arguments)) Unix.stdin Unix.stdout Unix.stderr in
+  match snd (Unix.waitpid [] pid) with
+  | Unix.WEXITED 0 -> ()
+  | Unix.WEXITED code -> exit code
+  | _ -> failwith "Dune was interrupted"
+
+let () =
+  try
+    let prefix = match List.tl (Array.to_list Sys.argv) with
+      | [] ->
+        (match Sys.getenv_opt "HOME" with
+         | Some home when home <> "" && not (Filename.is_relative home) -> Filename.concat home ".local"
+         | _ -> failwith "HOME must be an absolute directory, or use --prefix DIR")
+      | ["--prefix"; path] when path <> "" && path.[0] <> '-' -> path
+      | ["--help"] | ["-h"] -> print_string usage; exit 0
+      | _ -> prerr_string usage; exit 2
+    in
+    let prefix = if Filename.is_relative prefix then Filename.concat (Sys.getcwd ()) prefix else prefix in
+    Unix.chdir (Filename.dirname (Unix.realpath Sys.argv.(0)));
+    run ["build"; "--root"; "."; "@install"];
+    run ["install"; "--root"; "."; "--prefix"; prefix; "--sections"; "bin"; "--destdir"; "/"];
+    let bin = Filename.concat prefix "bin" in
+    Printf.printf "\nInstalled: %s\n" (Filename.concat bin "mantle");
+    let path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
+    if not (List.mem bin (String.split_on_char ':' path)) then
+      Printf.printf "Add to PATH:\n  export PATH=%s:\"$PATH\"\n" (quote bin);
+    print_endline "Activate in Bash: eval \"$(mantle init bash)\"\nActivate in Zsh:  eval \"$(mantle init zsh)\""
+  with
+  | Failure message | Sys_error message -> Printf.eprintf "install: %s\n" message; exit 1
+  | Unix.Unix_error (error, operation, path) ->
+    Printf.eprintf "install: %s: %s: %s\n" operation path (Unix.error_message error); exit 1

@@ -1,0 +1,4 @@
+(executable
+ (name mantle)
+ (public_name mantle)
+ (libraries unix))

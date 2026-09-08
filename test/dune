@@ -1,0 +1,5 @@
+(test
+ (name integration)
+ (libraries unix str)
+ (deps ../mantle.ml ../dune ../dune-project)
+ (action (run %{test} %{dep:../install} %{bin:ocaml} %{bin:dune})))
