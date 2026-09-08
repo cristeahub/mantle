@@ -2,7 +2,8 @@
 
 ![Mantle: one core, many states](assets/mantle.png)
 
-Switch between work and private Codex homes in Bash or Zsh, then keep running ordinary `codex`.
+Switch between named Codex profiles in Bash or Zsh, then keep running ordinary `codex`.
+`work` and `private` are the default profiles; you can create more.
 
 ```text
 ~/project (main) (work) ❯ codex
@@ -57,7 +58,29 @@ To try without installing, run `dune build`, then use `./_build/default/mantle.e
 Integration pins the absolute executable path, so install before saving it in a startup file.
 Initialization defines shell functions without selecting a context or changing `PS1`; repeated initialization does not stack wrappers.
 
-## Select and log in
+## Profiles and login
+
+```sh
+mantle list                 # List all profile names, alphabetically.
+mantle create client-a      # Create a profile without switching this shell.
+mantle client-a             # Select it just like work or private.
+codex login                # Log into this profile's account once.
+codex
+mantle off
+```
+
+Every profile uses `~/.local/share/mantle/profiles/NAME/codex/` for its Codex home.
+The profile directories are the profile store; there is no separate registry to migrate or synchronize.
+`mantle list` always includes `private` and `work`, even before their first use, and does not create or change files.
+Default homes are initialized when selected or explicitly created.
+Selecting an unknown name reports an error; use `mantle create NAME` first.
+Creating an existing profile again preserves its configuration, credentials, and history.
+
+Names must start with a lowercase letter, use only `a-z`, `0-9`, `-`, or `_`, and contain at most 32 characters.
+The command names `init`, `list`, `create`, `off`, `status`, and `prompt` are reserved.
+
+Existing `work` and `private` profiles are recognized in place, preserving their current homes, logins, configuration, and history.
+After upgrading, open a new terminal or reload shell integration with `eval "$(mantle init bash)"` or `eval "$(mantle init zsh)"` so the shell can select new names.
 
 | Command          | Selected `CODEX_HOME`                           |
 | ---------------- | ----------------------------------------------- |
@@ -121,9 +144,9 @@ esac
 ```
 
 For themes that rebuild `PS1`, insert the expression in the theme's prompt definition.
-`mantle prompt` reads only environment variables and prints exactly `(work)`, `(private)`, or nothing, without a newline.
+`mantle prompt` reads only environment variables and prints `(NAME)` for the selected profile, or nothing when inactive, without a newline.
 It returns nothing after deactivation or when the effective home no longer matches the selection.
-The labels occupy six and nine columns respectively; do not enclose visible text in Bash's `\[...\]` or Zsh's `%{...%}` nonprinting markers.
+Labels occupy the profile name's length plus two columns, such as six for `(work)` and nine for `(private)`; do not enclose visible text in Bash's `\[...\]` or Zsh's `%{...%}` nonprinting markers.
 Color belongs in your existing prompt styling.
 
 ## Status and boundaries
@@ -151,7 +174,7 @@ dune runtest
 
 The installer, integration runner, and fake Codex are OCaml, using temporary homes and both shells.
 The native `script` utility supplies the Bash terminal test.
-Checks cover installation/upgrades, consent and repeated shell setup, failed builds, arguments/cwd, concurrent shells, running and inherited children, restoration, quoting, permissions, failures, and prompt rendering/width.
+Checks cover installation/upgrades, consent and repeated shell setup, profile listing/creation and existing-profile adoption, failed builds, arguments/cwd, concurrent shells, running and inherited children, restoration, quoting, permissions, failures, and prompt rendering/width.
 
 On 2026-09-08, installed `codex-cli 0.153.4` on macOS connected ordinary interactive invocations to separate temporary home-local control sockets.
 The native daemon diagnostic hit the Unix socket length limit (104 bytes for the requested private-home socket under `/Users/christoffer`), while ordinary startup with an even longer home reached ChatGPT login.

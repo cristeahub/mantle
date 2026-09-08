@@ -97,20 +97,27 @@ let check_shell root binary_dir binary shell =
   mkdir cwd;
   let profiles = user_dir / ".local/share/mantle/profiles" in
   let work = profiles / "work/codex" and private_profile = profiles / "private/codex" in
+  let custom = profiles / "client-a_2/codex" in
   let env = ["PATH", binary_dir ^ ":/usr/bin:/bin"; "HOME", user_dir; "TERM", "dumb";
-             "SHELL", shell; "BINARY", binary; "TEST_SHELL", name; "WORK", work; "PRIVATE", private_profile] in
+             "SHELL", shell; "BINARY", binary; "TEST_SHELL", name; "WORK", work; "PRIVATE", private_profile; "CUSTOM", custom] in
   let spawn extra script =
     start ~root ~env:(replace env extra) ~cwd (shell :: flags shell @ ["-c"; "set -eu\n" ^ script]) in
   let run ?(extra = []) ?(expected = 0) script =
     finish ~expected (shell ^ "\n" ^ script) (spawn extra script) in
   let check ?(extra = []) script = ignore (run ~extra script) in
 
+  (* Defaults are available before any profile has been initialized; listing is read-only. *)
+  assert ((run "\"$BINARY\" list").output = "private\nwork\n");
+  let result = run (init ^ "if mantle unknown; then exit 99; fi\ntest \"${CODEX_HOME+x}\" = \"\"") in
+  assert (contains result.error "mantle create unknown");
+  assert (not (Sys.file_exists (user_dir / ".local")));
   (* Direct execution cannot change a parent shell; malformed commands emit no code. *)
   List.iter (fun args ->
     let result = run ~expected:1 ("\"$BINARY\" " ^ String.concat " " (List.map quote args)) in
     assert (result.output = ""))
     [["work"]; ["private"]; ["off"]; ["invalid"]; ["init"; "fish"];
-     ["work"; "extra"]; ["prompt"; "extra"]; ["_home"; "other"]];
+     ["work"; "extra"]; ["prompt"; "extra"]; ["_home"; "other"];
+     ["create"]; ["create"; "client"; "extra"]; ["list"; "extra"]];
   let result = run (init ^ {|
 test "$(mantle prompt)" = ""
 test "$("$BINARY" prompt)" = ""
@@ -159,10 +166,67 @@ test "$("$BINARY" prompt; printf X)" = X
   check (init ^ "mantle work\nmantle private\nmantle work");
   assert (read config = original_config && read auth = original_auth && mode auth = 0o600);
   assert (not (Sys.file_exists (private_profile / "auth.json")));
+
+  (* Custom profiles use the same commands, homes, permissions, and preservation rules. *)
+  check (init ^ {|
+"$BINARY" create client-a_2 >/dev/null
+test "${CODEX_HOME+x}" = ""
+test "$(mantle prompt)" = ""
+mantle work
+mantle create playground >/dev/null
+test "$CODEX_HOME" = "$WORK"
+test "$(mantle prompt)" = '(work)'
+mantle client-a_2
+test "$CODEX_HOME" = "$CUSTOM"
+test "$(mantle prompt; printf X)" = '(client-a_2)X'
+test "$("$BINARY" prompt; printf X)" = '(client-a_2)X'
+if mantle unknown; then exit 97; fi
+if mantle client-a_2 extra; then exit 98; fi
+test "$CODEX_HOME" = "$CUSTOM"
+test "$(mantle prompt)" = '(client-a_2)'
+mantle off
+test "${CODEX_HOME+x}" = ""
+|});
+  let listing = "client-a_2\nplayground\nprivate\nwork\n" in
+  assert ((run (init ^ "mantle list")).output = listing);
+  assert (not (Sys.file_exists (profiles / "unknown")));
+  assert (mode custom = 0o700 && mode (Filename.dirname custom) = 0o700 && mode (custom / "config.toml") = 0o600);
+  let custom_config = read (custom / "config.toml") ^ "# Keep custom settings\n" in
+  List.iter (fun (file, contents) -> write (custom / file) contents)
+    ["config.toml", custom_config; "auth.json", original_auth; "history.jsonl", "custom history\n"];
+  let result = run (init ^ {|
+mantle create client-a_2 >/dev/null
+mantle client-a_2
+codex 'custom argument' ''
+mantle create client-a_2 >/dev/null
+mantle off
+|}) in
+  assert (decode result.output = { codex_home = Some custom; cwd; args = ["custom argument"; ""] });
+  assert (read (custom / "config.toml") = custom_config && read (custom / "auth.json") = original_auth);
+  assert (read (custom / "history.jsonl") = "custom history\n" && mode (custom / "auth.json") = 0o600);
+  let result = run (init ^ "mantle client-a_2\nmantle status") in
+  assert (contains result.output "Context: client-a_2 (selection only)" && contains result.output custom);
+
+  (* Names cannot escape their directory, inject prompt syntax, or shadow commands. *)
+  List.iter (fun profile ->
+    let result = run ~expected:1 ("\"$BINARY\" create " ^ quote profile) in
+    assert (result.output = ""))
+    [""; "."; ".."; "../escape"; "/escape"; "a/b"; "Upper"; "_internal"; "--flag";
+     "a b"; "a$(touch INJECTED)"; "a%F{red}"; "a\nline"; String.make 33 'a';
+     "init"; "list"; "create"; "off"; "status"; "prompt"];
+  assert ((run "\"$BINARY\" list").output = listing);
+  assert (not (Sys.file_exists (cwd / "INJECTED")));
+  Unix.symlink (profiles / "work") (profiles / "alias");
+  write (profiles / "notes") "not a profile";
+  assert ((run "\"$BINARY\" list").output = listing);
+  check (init ^ "mantle client-a_2\nif mantle alias; then exit 99; fi\nif mantle create alias; then exit 99; fi\ntest \"$CODEX_HOME\" = \"$CUSTOM\"");
+  Unix.unlink (profiles / "alias");
+  Unix.unlink (profiles / "notes");
   List.iter (fun previous ->
     check ~extra:["CODEX_HOME", previous; "PREVIOUS", previous] (init ^ {|
 mantle work
 mantle private
+mantle client-a_2
 eval "$(mantle init "$TEST_SHELL")"
 mantle off
 test "${CODEX_HOME+x}" = x
@@ -172,7 +236,7 @@ test "$(mantle prompt)" = ""
   let result = run (init ^ {|
 CODEX_HOME='shell-local value'
 mantle work
-mantle private
+mantle client-a_2
 mantle off
 test "$CODEX_HOME" = 'shell-local value'
 codex
@@ -188,7 +252,7 @@ test "${CODEX_HOME-}" = ""
 |});
   List.iter (fun variable ->
     let result = run ~extra:[variable, "SECRET_OVERRIDE"]
-      (init ^ "if mantle work; then exit 99; fi\ntest \"${CODEX_HOME+x}\" = \"\"") in
+      (init ^ "mantle create client-a_2 >/dev/null\nif mantle work; then exit 99; fi\nif mantle client-a_2; then exit 99; fi\ntest \"${CODEX_HOME+x}\" = \"\"") in
     assert (contains result.error variable);
     assert (not (contains (result.output ^ result.error) "SECRET_OVERRIDE")))
     ["CODEX_ACCESS_TOKEN"; "CODEX_API_KEY"; "OPENAI_API_KEY"; "CODEX_SQLITE_HOME"];
@@ -201,7 +265,8 @@ test "${CODEX_HOME-}" = ""
       let script = "set -eu\neval \"$(\"$BINARY\" init " ^ Filename.basename child ^ ")\"\n" ^ {|
 test "$CODEX_HOME" = "$WORK"
 test "$(mantle prompt)" = '(work)'
-mantle private
+mantle client-a_2
+test "$CODEX_HOME" = "$CUSTOM"
 mantle off
 test "${CODEX_HOME+x}" = "$EXPECT_SET"
 test "${CODEX_HOME-}" = "$PREVIOUS"
@@ -274,7 +339,7 @@ test "$(mantle prompt)" = '(work)'
   let ready = root / (name ^ "-ready") and release = root / (name ^ "-release") and record = root / (name ^ "-record") in
   Fun.protect ~finally:(fun () -> write release "") (fun () ->
     check ~extra:["READY", ready; "RELEASE", release; "RECORD", record] (init ^ {|
-mantle work
+mantle client-a_2
 codex hold &
 agent=$!
 while [ ! -e "$READY" ]; do sleep 0.01; done
@@ -283,7 +348,7 @@ test "$CODEX_HOME" = "$PRIVATE"
 : > "$RELEASE"
 wait "$agent"
 |}));
-  assert ((decode (read record)).codex_home = Some work);
+  assert ((decode (read record)).codex_home = Some custom);
   check (init ^ "test \"${CODEX_HOME+x}\" = \"\"\ntest \"$(mantle prompt)\" = \"\"");
 
   (* Concurrent first setup includes two shells selecting the same profile. *)
@@ -296,8 +361,8 @@ wait "$agent"
       let prefix = root / Printf.sprintf "%s-concurrent-%d" name index in
       let ready = prefix ^ "-ready" and record = prefix ^ "-record" in
       let child = spawn ["HOME", concurrent_dir; "READY", ready; "RELEASE", release; "RECORD", record]
-        (init ^ "mantle " ^ profile ^ "\ncodex hold") in
-      jobs := (child, ready, record, profile) :: !jobs) ["work"; "private"; "work"];
+        (init ^ "mantle create " ^ profile ^ " >/dev/null\nmantle " ^ profile ^ "\ncodex hold") in
+      jobs := (child, ready, record, profile) :: !jobs) ["work"; "private"; "client-a_2"; "client-a_2"];
     wait_until "concurrent shells ready" (fun () -> List.for_all (fun (_, ready, _, _) -> Sys.file_exists ready) !jobs);
     write release "";
     List.iter (fun (child, _, record, profile) ->
@@ -322,6 +387,8 @@ test "$(print -P -- '$(mantle prompt)%(6l.yes.no)')" = '(work)yes'
 test "$(print -P -- '$(mantle prompt)%(7l.bad.good)')" = '(work)good'
 mantle private
 test "$(print -P -- '$(mantle prompt)%(9l.yes.no)')" = '(private)yes'
+mantle client-a_2
+test "$(print -P -- '$(mantle prompt)%(12l.yes.no)')" = '(client-a_2)yes'
 mantle off
 test "$(print -P -- "$PS1")" = ' project (main) > '
 |});
@@ -348,10 +415,29 @@ test "$(print -P -- "$PS1")" = ' project (main) > '
       prompt "(work) project (main) > ";
       send "mantle private";
       prompt "(private) project (main) > ";
+      send "mantle client-a_2";
+      prompt "(client-a_2) project (main) > ";
       send "mantle off";
       prompt " project (main) > ";
       send "exit";
       ignore (finish "Bash PTY prompt rendering" child)));
+
+  (* Adopt the original work/private layout without moving or rewriting its data. *)
+  let legacy = root / (name ^ " legacy home") in
+  List.iter mkdir [legacy; legacy / ".local"; legacy / ".local/share"; legacy / ".local/share/mantle";
+                  legacy / ".local/share/mantle/profiles"];
+  let legacy_profiles = legacy / ".local/share/mantle/profiles" in
+  List.iter (fun profile ->
+    let home = legacy_profiles / profile / "codex" in
+    List.iter mkdir [legacy_profiles / profile; home];
+    List.iter (fun file -> write (home / file) ("existing " ^ profile ^ " " ^ file ^ "\n"))
+      ["config.toml"; "auth.json"; "history.jsonl"]) ["work"; "private"];
+  let extra = ["HOME", legacy; "WORK", legacy_profiles / "work/codex"; "PRIVATE", legacy_profiles / "private/codex"] in
+  assert ((run ~extra "\"$BINARY\" list").output = "private\nwork\n");
+  check ~extra (init ^ "mantle work\ntest \"$CODEX_HOME\" = \"$WORK\"\nmantle private\ntest \"$CODEX_HOME\" = \"$PRIVATE\"\nmantle create work >/dev/null\nmantle off");
+  List.iter (fun profile -> List.iter (fun file ->
+    assert (read (legacy_profiles / profile / "codex" / file) = "existing " ^ profile ^ " " ^ file ^ "\n"))
+    ["config.toml"; "auth.json"; "history.jsonl"]) ["work"; "private"];
   Printf.printf "%s: public commands, isolation, restoration, quoting, permissions, failures, prompts passed\n%!" name
 
 let check_install root =
