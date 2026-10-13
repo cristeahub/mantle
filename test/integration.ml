@@ -1,4 +1,4 @@
-(* Exercise public shell workflows with temporary homes and an OCaml fake Codex. *)
+(* Exercise public shell workflows with temporary homes and OCaml fake CLIs. *)
 let ( / ) = Filename.concat
 let quote value = "'" ^ String.concat "'\\''" (String.split_on_char '\'' value) ^ "'"
 let contains text part =
@@ -24,18 +24,25 @@ let wait_until description ready =
     Unix.sleepf 0.01
   done
 
-type invocation = { codex_home : string option; cwd : string; args : string list }
+type invocation = { codex_home : string option; claude_home : string option; cwd : string; args : string list }
 
-(* The test executable is also copied onto PATH as codex, without another runtime. *)
-let fake_codex () =
+(* The test executable is also copied onto PATH as both CLIs, without another runtime. *)
+let fake_cli () =
+  let claude = Filename.basename Sys.argv.(0) = "claude" in
   let args = List.tl (Array.to_list Sys.argv) in
-  if args = ["login"; "status"] then (
+  if args = (if claude then ["auth"; "status"] else ["login"; "status"]) then (
+    print_endline "SECRET_NATIVE_OUTPUT_MUST_NOT_LEAK";
     prerr_endline "SECRET_NATIVE_OUTPUT_MUST_NOT_LEAK";
-    exit (int_of_string (Option.value (Sys.getenv_opt "FAKE_LOGIN_EXIT") ~default:"0")));
+    if Sys.getenv_opt "FAKE_LOGIN_SIGNAL" = Some (if claude then "claude" else "codex") then
+      Unix.kill (Unix.getpid ()) Sys.sigterm;
+    let variable = if claude then "FAKE_CLAUDE_LOGIN_EXIT" else "FAKE_LOGIN_EXIT" in
+    exit (int_of_string (Option.value (Sys.getenv_opt variable) ~default:"0")));
+  if List.exists (fun arg -> List.mem arg ["login"; "auth"]) args then exit 2;
   if args = ["hold"] then (
     write (Sys.getenv "READY") "";
-    wait_until "fake Codex release" (fun () -> Sys.file_exists (Sys.getenv "RELEASE")));
-  let record = { codex_home = Sys.getenv_opt "CODEX_HOME"; cwd = Sys.getcwd (); args } in
+    wait_until "fake CLI release" (fun () -> Sys.file_exists (Sys.getenv "RELEASE")));
+  let record = { codex_home = Sys.getenv_opt "CODEX_HOME"; claude_home = Sys.getenv_opt "CLAUDE_CONFIG_DIR";
+                 cwd = Sys.getcwd (); args } in
   let contents = Marshal.to_string record [] in
   match Sys.getenv_opt "RECORD" with
   | Some path -> write path contents
@@ -98,6 +105,8 @@ let check_shell root binary_dir binary shell =
   let profiles = user_dir / ".local/share/mantle/profiles" in
   let work = profiles / "work/codex" and private_profile = profiles / "private/codex" in
   let custom = profiles / "client-a_2/codex" in
+  let claude_work = profiles / "work/claude" and claude_private = profiles / "private/claude" in
+  let claude_custom = profiles / "client-a_2/claude" in
   let env = ["PATH", binary_dir ^ ":/usr/bin:/bin"; "HOME", user_dir; "TERM", "dumb";
              "SHELL", shell; "BINARY", binary; "TEST_SHELL", name; "WORK", work; "PRIVATE", private_profile; "CUSTOM", custom] in
   let spawn extra script =
@@ -123,14 +132,17 @@ test "$(mantle prompt)" = ""
 test "$("$BINARY" prompt)" = ""
 mantle off
 test "${CODEX_HOME+x}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = ""
 mantle work
 test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
 test "$(mantle prompt)" = '(work)'
 test "$("$BINARY" prompt)" = '(work)'
 test "$(mantle prompt; printf X)" = '(work)X'
 codex 'arg with spaces' '' "quote'" '$(touch INJECTED)' '--flag=*'
 mantle private
 test "$CODEX_HOME" = "$PRIVATE"
+test "$CLAUDE_CONFIG_DIR" = "${PRIVATE%/codex}/claude"
 test "$(mantle prompt; printf X)" = '(private)X'
 eval "$(mantle init "$TEST_SHELL")"
 eval "$(mantle init "$TEST_SHELL")"
@@ -140,22 +152,32 @@ test "$(mantle prompt)" = '(work)'
 if mantle work extra; then exit 90; fi
 if mantle other; then exit 91; fi
 test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
 test "$(mantle prompt)" = '(work)'
 mantle off
 mantle off
 test "${CODEX_HOME+x}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = ""
 test "${MANTLE_CONTEXT+x}" = ""
 test "$(mantle prompt; printf X)" = X
 test "$("$BINARY" prompt; printf X)" = X
 |}) in
-  assert (decode result.output = { codex_home = Some work; cwd;
+  assert (decode result.output = { codex_home = Some work; claude_home = Some claude_work; cwd;
+    args = ["arg with spaces"; ""; "quote'"; "$(touch INJECTED)"; "--flag=*"] });
+  let result = run (init ^ {|
+mantle private
+claude 'arg with spaces' '' "quote'" '$(touch INJECTED)' '--flag=*'
+mantle off
+|}) in
+  assert (decode result.output = { codex_home = Some private_profile; claude_home = Some claude_private; cwd;
     args = ["arg with spaces"; ""; "quote'"; "$(touch INJECTED)"; "--flag=*"] });
   assert (not (Sys.file_exists (cwd / "INJECTED")));
 
   (* Every profile directory is private; repeated setup preserves exact file contents. *)
   let mode path = (Unix.stat path).Unix.st_perm land 0o777 in
   List.iter (fun path -> assert (mode path = 0o700))
-    [Filename.dirname profiles; profiles; profiles / "work"; profiles / "private"; work; private_profile];
+    [Filename.dirname profiles; profiles; profiles / "work"; profiles / "private";
+     work; private_profile; claude_work; claude_private];
   let config = work / "config.toml" and auth = work / "auth.json" in
   assert (mode config = 0o600);
   let original_config = read config ^ "\n# User setting\nmodel = \"custom-model\"\n" in
@@ -166,18 +188,32 @@ test "$("$BINARY" prompt; printf X)" = X
   check (init ^ "mantle work\nmantle private\nmantle work");
   assert (read config = original_config && read auth = original_auth && mode auth = 0o600);
   assert (not (Sys.file_exists (private_profile / "auth.json")));
+  let claude_settings = claude_work / "settings.json" in
+  assert (read claude_settings = "{\n  \"forceLoginMethod\": \"claudeai\"\n}\n" && mode claude_settings = 0o600);
+  let original_claude_settings = "{\"forceLoginMethod\":\"claudeai\",\"model\":\"custom-model\"}\n" in
+  write claude_settings original_claude_settings;
+  List.iter (fun file -> write (claude_work / file) original_auth; Unix.chmod (claude_work / file) 0o644)
+    [".claude.json"; ".credentials.json"];
+  check (init ^ "mantle work\nmantle private\nmantle work");
+  assert (read claude_settings = original_claude_settings);
+  List.iter (fun file -> assert (read (claude_work / file) = original_auth && mode (claude_work / file) = 0o600))
+    [".claude.json"; ".credentials.json"];
+  assert (not (Sys.file_exists (claude_private / ".credentials.json")));
 
   (* Custom profiles use the same commands, homes, permissions, and preservation rules. *)
   check (init ^ {|
 "$BINARY" create client-a_2 >/dev/null
 test "${CODEX_HOME+x}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = ""
 test "$(mantle prompt)" = ""
 mantle work
 mantle create playground >/dev/null
 test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
 test "$(mantle prompt)" = '(work)'
 mantle client-a_2
 test "$CODEX_HOME" = "$CUSTOM"
+test "$CLAUDE_CONFIG_DIR" = "${CUSTOM%/codex}/claude"
 test "$(mantle prompt; printf X)" = '(client-a_2)X'
 test "$("$BINARY" prompt; printf X)" = '(client-a_2)X'
 if mantle unknown; then exit 97; fi
@@ -186,11 +222,13 @@ test "$CODEX_HOME" = "$CUSTOM"
 test "$(mantle prompt)" = '(client-a_2)'
 mantle off
 test "${CODEX_HOME+x}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = ""
 |});
   let listing = "client-a_2\nplayground\nprivate\nwork\n" in
   assert ((run (init ^ "mantle list")).output = listing);
   assert (not (Sys.file_exists (profiles / "unknown")));
   assert (mode custom = 0o700 && mode (Filename.dirname custom) = 0o700 && mode (custom / "config.toml") = 0o600);
+  assert (mode claude_custom = 0o700 && mode (claude_custom / "settings.json") = 0o600);
   let custom_config = read (custom / "config.toml") ^ "# Keep custom settings\n" in
   List.iter (fun (file, contents) -> write (custom / file) contents)
     ["config.toml", custom_config; "auth.json", original_auth; "history.jsonl", "custom history\n"];
@@ -201,7 +239,8 @@ codex 'custom argument' ''
 mantle create client-a_2 >/dev/null
 mantle off
 |}) in
-  assert (decode result.output = { codex_home = Some custom; cwd; args = ["custom argument"; ""] });
+  assert (decode result.output = { codex_home = Some custom; claude_home = Some claude_custom;
+                                 cwd; args = ["custom argument"; ""] });
   assert (read (custom / "config.toml") = custom_config && read (custom / "auth.json") = original_auth);
   assert (read (custom / "history.jsonl") = "custom history\n" && mode (custom / "auth.json") = 0o600);
   let result = run (init ^ "mantle client-a_2\nmantle status") in
@@ -222,6 +261,28 @@ mantle off
   check (init ^ "mantle client-a_2\nif mantle alias; then exit 99; fi\nif mantle create alias; then exit 99; fi\ntest \"$CODEX_HOME\" = \"$CUSTOM\"");
   Unix.unlink (profiles / "alias");
   Unix.unlink (profiles / "notes");
+
+  (* Restore the two variables independently, including shell-local and empty values. *)
+  let states = [None; Some (false, ""); Some (true, "");
+                Some (false, "local ' $(touch INJECTED)\ntrailing\n");
+                Some (true, "exported ' $(touch INJECTED)\ntrailing\n")] in
+  let assignment variable = function
+    | None -> "unset " ^ variable ^ "\n"
+    | Some (exported, value) -> (if exported then "export " else "") ^ variable ^ "=" ^ quote value ^ "\n" in
+  let restored variable state =
+    let value = match state with None -> "" | Some (_, value) -> value in
+    Printf.sprintf "test \"${%s+x}\" = %s\ntest \"${%s-}\" = %s\n"
+      variable (quote (if state = None then "" else "x")) variable (quote value) in
+  let inherited = function Some (true, value) -> Some value | _ -> None in
+  List.iter (fun codex_state -> List.iter (fun claude_state ->
+    let result = run (assignment "CODEX_HOME" codex_state ^ assignment "CLAUDE_CONFIG_DIR" claude_state
+      ^ init ^ "mantle work\nmantle private\nmantle client-a_2\n" ^ init ^ "mantle off\nmantle off\n"
+      ^ restored "CODEX_HOME" codex_state ^ restored "CLAUDE_CONFIG_DIR" claude_state
+      ^ "test \"$(mantle prompt)\" = \"\"\nclaude\n") in
+    let invocation = decode result.output in
+    assert (invocation.codex_home = inherited codex_state && invocation.claude_home = inherited claude_state)) states) states;
+  assert (not (Sys.file_exists (cwd / "INJECTED")));
+
   List.iter (fun previous ->
     check ~extra:["CODEX_HOME", previous; "PREVIOUS", previous] (init ^ {|
 mantle work
@@ -244,55 +305,114 @@ codex
   assert ((decode result.output).codex_home = None);
   check (init ^ {|
 export CODEX_HOME
+export CLAUDE_CONFIG_DIR
 test_previous_set=${CODEX_HOME+x}
+test_claude_previous_set=${CLAUDE_CONFIG_DIR+x}
 mantle work
 mantle off
 test "${CODEX_HOME+x}" = "$test_previous_set"
 test "${CODEX_HOME-}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = "$test_claude_previous_set"
+test "${CLAUDE_CONFIG_DIR-}" = ""
 |});
   List.iter (fun variable ->
     let result = run ~extra:[variable, "SECRET_OVERRIDE"]
-      (init ^ "mantle create client-a_2 >/dev/null\nif mantle work; then exit 99; fi\nif mantle client-a_2; then exit 99; fi\ntest \"${CODEX_HOME+x}\" = \"\"") in
+      (init ^ "mantle create client-a_2 >/dev/null\nif mantle work; then exit 99; fi\nif mantle client-a_2; then exit 99; fi\ntest \"${CODEX_HOME+x}\" = \"\"\ntest \"${CLAUDE_CONFIG_DIR+x}\" = \"\"") in
     assert (contains result.error variable);
     assert (not (contains (result.output ^ result.error) "SECRET_OVERRIDE")))
-    ["CODEX_ACCESS_TOKEN"; "CODEX_API_KEY"; "OPENAI_API_KEY"; "CODEX_SQLITE_HOME"];
+    ["CODEX_ACCESS_TOKEN"; "CODEX_API_KEY"; "OPENAI_API_KEY"; "CODEX_SQLITE_HOME";
+     "ANTHROPIC_API_KEY"; "ANTHROPIC_AUTH_TOKEN"; "ANTHROPIC_BASE_URL"; "ANTHROPIC_PROFILE";
+     "ANTHROPIC_FEDERATION_RULE_ID"; "ANTHROPIC_ORGANIZATION_ID";
+     "CLAUDE_CODE_OAUTH_TOKEN"; "CLAUDE_CODE_OAUTH_REFRESH_TOKEN";
+     "CLAUDE_CODE_USE_BEDROCK"; "CLAUDE_CODE_USE_VERTEX"; "CLAUDE_CODE_USE_FOUNDRY";
+     "CLAUDE_CODE_USE_ANTHROPIC_AWS"; "CLAUDE_CODE_USE_MANTLE"];
+  let result = run (init ^ {|
+mantle work
+export ANTHROPIC_API_KEY=SECRET_OVERRIDE
+if mantle private; then exit 99; fi
+test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
+test "$(mantle prompt)" = '(work)'
+mantle off
+test "$ANTHROPIC_API_KEY" = SECRET_OVERRIDE
+test "${CODEX_HOME+x}" = ""
+test "${CLAUDE_CONFIG_DIR+x}" = ""
+|}) in
+  assert (not (contains (result.output ^ result.error) "SECRET_OVERRIDE"));
 
   (* Child shells inherit both context and the original restoration snapshot. *)
   List.iter (fun previous ->
     let extra = ["PREVIOUS", Option.value previous ~default:""; "EXPECT_SET", if previous = None then "" else "x"]
-      @ (match previous with None -> [] | Some value -> ["CODEX_HOME", value]) in
+      @ (match previous with None -> [] | Some value -> ["CODEX_HOME", value; "CLAUDE_CONFIG_DIR", value]) in
     List.iter (fun child ->
       let script = "set -eu\neval \"$(\"$BINARY\" init " ^ Filename.basename child ^ ")\"\n" ^ {|
 test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
 test "$(mantle prompt)" = '(work)'
 mantle client-a_2
 test "$CODEX_HOME" = "$CUSTOM"
+test "$CLAUDE_CONFIG_DIR" = "${CUSTOM%/codex}/claude"
 mantle off
 test "${CODEX_HOME+x}" = "$EXPECT_SET"
 test "${CODEX_HOME-}" = "$PREVIOUS"
+test "${CLAUDE_CONFIG_DIR+x}" = "$EXPECT_SET"
+test "${CLAUDE_CONFIG_DIR-}" = "$PREVIOUS"
 |} in
       check ~extra (init ^ "mantle work\n" ^ String.concat " " (List.map quote (child :: flags child @ ["-c"; script]))
         ^ "\ntest \"$CODEX_HOME\" = \"$WORK\"\ntest \"$(mantle prompt)\" = '(work)'")) shells)
     [None; Some ""; Some (root / "original custom")];
+  List.iter (fun child ->
+    let script = "set -eu\neval \"$(\"$BINARY\" init " ^ Filename.basename child ^ ")\"\n" ^ {|
+mantle private
+mantle off
+test "$CODEX_HOME" = 'local codex'
+test "$CLAUDE_CONFIG_DIR" = 'local claude'
+claude
+|} in
+    let result = run (init ^ "CODEX_HOME='local codex'\nCLAUDE_CONFIG_DIR='local claude'\nmantle work\n"
+      ^ String.concat " " (List.map quote (child :: flags child @ ["-c"; script]))
+      ^ "\ntest \"$CODEX_HOME\" = \"$WORK\"\ntest \"$CLAUDE_CONFIG_DIR\" = \"${WORK%/codex}/claude\"") in
+    let invocation = decode result.output in
+    assert (invocation.codex_home = None && invocation.claude_home = None)) shells;
+
+  (* Reloading integration in an active Codex-only shell preserves its original snapshot. *)
+  check ~extra:["CODEX_HOME", work; "_MANTLE_PREV_STATE", "export"; "_MANTLE_PREV_HOME", "original codex";
+                "_MANTLE_SELECTED_HOME", work; "MANTLE_CONTEXT", "work"; "CLAUDE_CONFIG_DIR", "original claude"]
+    (init ^ {|
+test "$(mantle prompt)" = ""
+mantle private
+test "$CLAUDE_CONFIG_DIR" = "${PRIVATE%/codex}/claude"
+mantle off
+test "$CODEX_HOME" = 'original codex'
+test "$CLAUDE_CONFIG_DIR" = 'original claude'
+|});
+  check ~extra:["CODEX_HOME", work; "_MANTLE_PREV_STATE", "unset"; "_MANTLE_SELECTED_HOME", work;
+                "MANTLE_CONTEXT", "work"; "CLAUDE_CONFIG_DIR", "original claude"]
+    (init ^ "mantle off\ntest \"${CODEX_HOME+x}\" = \"\"\ntest \"$CLAUDE_CONFIG_DIR\" = 'original claude'");
 
   (* Readonly variables and failed setup must leave the previous environment intact. *)
   List.iter (fun variable -> check (init ^ "readonly " ^ variable ^ "=locked\n" ^ {|
 if mantle work; then exit 92; fi
 test "${CODEX_HOME-locked}" = locked
+test "${CLAUDE_CONFIG_DIR-locked}" = locked
 test "${_MANTLE_PREV_HOME-locked}" = locked
 test "${_MANTLE_PREV_STATE-locked}" = locked
 test "${_MANTLE_SELECTED_HOME-locked}" = locked
+test "${_MANTLE_PREV_CLAUDE_HOME-locked}" = locked
+test "${_MANTLE_PREV_CLAUDE_STATE-locked}" = locked
+test "${_MANTLE_SELECTED_CLAUDE_HOME-locked}" = locked
 test "${MANTLE_CONTEXT-locked}" = locked
 test "$(mantle prompt)" = ""
-|})) ["CODEX_HOME"; "MANTLE_CONTEXT"; "_MANTLE_SELECTED_HOME"; "_MANTLE_PREV_STATE"; "_MANTLE_PREV_HOME"];
-  check (init ^ {|
-mantle work
-readonly CODEX_HOME
+|})) ["CODEX_HOME"; "CLAUDE_CONFIG_DIR"; "MANTLE_CONTEXT"; "_MANTLE_SELECTED_HOME";
+         "_MANTLE_PREV_STATE"; "_MANTLE_PREV_HOME"; "_MANTLE_SELECTED_CLAUDE_HOME";
+         "_MANTLE_PREV_CLAUDE_STATE"; "_MANTLE_PREV_CLAUDE_HOME"];
+  List.iter (fun variable -> check (init ^ "mantle work\nreadonly " ^ variable ^ "\n" ^ {|
 if mantle private; then exit 93; fi
 if mantle off; then exit 94; fi
 test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
 test "$(mantle prompt)" = '(work)'
-|});
+|})) ["CODEX_HOME"; "CLAUDE_CONFIG_DIR"; "MANTLE_CONTEXT"; "_MANTLE_SELECTED_CLAUDE_HOME"];
   let private_config = private_profile / "config.toml" in
   Unix.unlink private_config;
   mkdir private_config;
@@ -304,7 +424,7 @@ test "$(mantle prompt)" = '(work)'
 |});
   Unix.rmdir private_config;
   Unix.symlink config private_config;
-  let fails profile = init ^ "if mantle " ^ profile ^ "; then exit 96; fi\ntest \"${CODEX_HOME+x}\" = \"\"" in
+  let fails profile = init ^ "if mantle " ^ profile ^ "; then exit 96; fi\ntest \"${CODEX_HOME+x}\" = \"\"\ntest \"${CLAUDE_CONFIG_DIR+x}\" = \"\"" in
   check (fails "private");
   assert (read config = original_config);
   Unix.unlink private_config;
@@ -315,6 +435,34 @@ test "$(mantle prompt)" = '(work)'
     check (fails "private");
     assert (read auth = original_auth);
     Unix.unlink private_auth) [Unix.symlink; Unix.link];
+  let private_claude_settings = claude_private / "settings.json" in
+  Unix.unlink private_claude_settings;
+  mkdir private_claude_settings;
+  check (init ^ {|
+mantle work
+if mantle private; then exit 95; fi
+test "$CODEX_HOME" = "$WORK"
+test "$CLAUDE_CONFIG_DIR" = "${WORK%/codex}/claude"
+test "$(mantle prompt)" = '(work)'
+|});
+  Unix.rmdir private_claude_settings;
+  List.iter (fun file -> List.iter (fun link ->
+    let source = claude_work / file and target = claude_private / file in
+    link source target;
+    check (fails "private");
+    assert (read source = (if file = "settings.json" then original_claude_settings else original_auth));
+    Unix.unlink target) [Unix.symlink; Unix.link]) ["settings.json"; ".claude.json"; ".credentials.json"];
+  Unix.symlink (claude_private / "missing") (claude_private / ".credentials.json");
+  check (fails "private");
+  Unix.unlink (claude_private / ".credentials.json");
+  check (init ^ "mantle private");
+  let redirected_claude = profiles / "redirected-claude" in
+  mkdir redirected_claude;
+  Unix.symlink claude_work (redirected_claude / "claude");
+  check (fails "redirected-claude");
+  assert (read claude_settings = original_claude_settings);
+  Unix.unlink (redirected_claude / "claude");
+  remove redirected_claude;
   let redirected = root / (name ^ " redirected") in
   List.iter mkdir [redirected; redirected / ".local"; redirected / ".local/share"];
   Unix.symlink (Filename.dirname profiles) (redirected / ".local/share/mantle");
@@ -327,29 +475,60 @@ test "$(mantle prompt)" = '(work)'
 
   let result = run (init ^ "mantle work\nmantle status") in
   List.iter (fun part -> assert (contains result.output part))
-    ["Context: work (selection only)"; "Codex home: " ^ work; "Native login: authenticated"; "not verified"];
+    ["Context: work (selection only)"; "Codex home: " ^ work; "Claude home: " ^ claude_work;
+     "Codex native login: authenticated"; "Claude native login: authenticated"; "not verified"];
   assert (not (contains (result.output ^ result.error) "SECRET"));
   let result = run ~extra:["FAKE_LOGIN_EXIT", "7"] ~expected:7 (init ^ "mantle status") in
-  assert (contains result.error "exited 7" && not (contains (result.output ^ result.error) "SECRET"));
+  assert (contains result.error "codex login status exited 7" && contains result.output "Claude native login: authenticated");
+  assert (not (contains (result.output ^ result.error) "SECRET"));
+  let result = run ~extra:["FAKE_CLAUDE_LOGIN_EXIT", "1"] ~expected:1 (init ^ "mantle status") in
+  assert (contains result.error "claude auth status exited 1" && contains result.output "Codex native login: authenticated");
+  assert (not (contains (result.output ^ result.error) "SECRET"));
+  let result = run ~extra:["FAKE_LOGIN_EXIT", "7"; "FAKE_CLAUDE_LOGIN_EXIT", "1"] ~expected:7 (init ^ "mantle status") in
+  assert (contains result.error "codex login status exited 7" && contains result.error "claude auth status exited 1");
+  List.iter (fun cli ->
+    let result = run ~extra:["FAKE_LOGIN_SIGNAL", cli] ~expected:1 (init ^ "mantle status") in
+    assert (contains result.error "was interrupted" && contains result.output "native login: authenticated");
+    assert (not (contains (result.output ^ result.error) "SECRET"))) ["codex"; "claude"];
+  List.iter (fun cli ->
+    let directory = root / (name ^ "-" ^ cli ^ "-only") in
+    mkdir directory;
+    copy (binary_dir / cli) (directory / cli);
+    let result = run ~extra:["PATH", directory] (init ^ "mantle work\nmantle status") in
+    assert (contains result.output "native login: authenticated" && contains result.output "not installed")) ["codex"; "claude"];
   let result = run ~extra:["PATH", "/nonexistent"] ~expected:1 (init ^ "mantle status") in
-  assert (contains result.error "not found on PATH");
-  check (init ^ "mantle work\nexport CODEX_HOME=/changed\ntest \"$(mantle prompt)\" = \"\"\ntest \"$(\"$BINARY\" prompt)\" = \"\"");
+  assert (contains result.error "no supported CLI found on PATH" && contains result.output "not installed");
+  let inaccessible = root / (name ^ "-inaccessible-cli") in
+  mkdir inaccessible;
+  write (inaccessible / "codex") "not executable";
+  Unix.chmod (inaccessible / "codex") 0o600;
+  copy (binary_dir / "claude") (inaccessible / "claude");
+  let result = run ~extra:["PATH", inaccessible] ~expected:1 (init ^ "mantle status") in
+  assert (contains result.error "Codex native login: unavailable" && contains result.output "Claude native login: authenticated");
+  let result = run ~extra:["CODEX_HOME", "relative-codex"; "CLAUDE_CONFIG_DIR", "relative-claude"] (init ^ "mantle status") in
+  assert (contains result.output ("Codex home: " ^ cwd / "relative-codex")
+          && contains result.output ("Claude home: " ^ cwd / "relative-claude"));
+  List.iter (fun variable ->
+    check (init ^ "mantle work\nexport " ^ variable ^ "=/changed\ntest \"$(mantle prompt)\" = \"\"\ntest \"$(\"$BINARY\" prompt)\" = \"\""))
+    ["CODEX_HOME"; "CLAUDE_CONFIG_DIR"];
 
-  (* A running Codex keeps its home while the parent shell switches. *)
-  let ready = root / (name ^ "-ready") and release = root / (name ^ "-release") and record = root / (name ^ "-record") in
-  Fun.protect ~finally:(fun () -> write release "") (fun () ->
-    check ~extra:["READY", ready; "RELEASE", release; "RECORD", record] (init ^ {|
-mantle client-a_2
-codex hold &
+  (* Running agents keep both homes while the parent shell switches. *)
+  List.iter (fun cli ->
+    let prefix = root / (name ^ "-" ^ cli) in
+    let ready = prefix ^ "-ready" and release = prefix ^ "-release" and record = prefix ^ "-record" in
+    Fun.protect ~finally:(fun () -> write release "") (fun () ->
+      check ~extra:["READY", ready; "RELEASE", release; "RECORD", record] (init ^ "mantle client-a_2\n" ^ cli ^ " hold &\n" ^ {|
 agent=$!
 while [ ! -e "$READY" ]; do sleep 0.01; done
 mantle private
 test "$CODEX_HOME" = "$PRIVATE"
+test "$CLAUDE_CONFIG_DIR" = "${PRIVATE%/codex}/claude"
 : > "$RELEASE"
 wait "$agent"
 |}));
-  assert ((decode (read record)).codex_home = Some custom);
-  check (init ^ "test \"${CODEX_HOME+x}\" = \"\"\ntest \"$(mantle prompt)\" = \"\"");
+    let invocation = decode (read record) in
+    assert (invocation.codex_home = Some custom && invocation.claude_home = Some claude_custom)) ["codex"; "claude"];
+  check (init ^ "test \"${CODEX_HOME+x}\" = \"\"\ntest \"${CLAUDE_CONFIG_DIR+x}\" = \"\"\ntest \"$(mantle prompt)\" = \"\"");
 
   (* Concurrent first setup includes two shells selecting the same profile. *)
   let concurrent_dir = root / (name ^ " concurrent") in
@@ -361,13 +540,17 @@ wait "$agent"
       let prefix = root / Printf.sprintf "%s-concurrent-%d" name index in
       let ready = prefix ^ "-ready" and record = prefix ^ "-record" in
       let child = spawn ["HOME", concurrent_dir; "READY", ready; "RELEASE", release; "RECORD", record]
-        (init ^ "mantle create " ^ profile ^ " >/dev/null\nmantle " ^ profile ^ "\ncodex hold") in
+        (init ^ "mantle create " ^ profile ^ " >/dev/null\nmantle " ^ profile ^ "\n"
+         ^ (if index mod 2 = 0 then "codex" else "claude") ^ " hold") in
       jobs := (child, ready, record, profile) :: !jobs) ["work"; "private"; "client-a_2"; "client-a_2"];
     wait_until "concurrent shells ready" (fun () -> List.for_all (fun (_, ready, _, _) -> Sys.file_exists ready) !jobs);
     write release "";
     List.iter (fun (child, _, record, profile) ->
       ignore (finish "concurrent shell" child);
-      assert ((decode (read record)).codex_home = Some (concurrent_dir / ".local/share/mantle/profiles" / profile / "codex"))) !jobs);
+      let invocation = decode (read record) in
+      let directory = concurrent_dir / ".local/share/mantle/profiles" / profile in
+      assert (invocation.codex_home = Some (directory / "codex") && invocation.claude_home = Some (directory / "claude"));
+      assert (read (directory / "claude/settings.json") = "{\n  \"forceLoginMethod\": \"claudeai\"\n}\n")) !jobs);
 
   (* The documented prompt insertion preserves Git text and is idempotent. *)
   let snippet = {|case "$PS1" in
@@ -554,14 +737,14 @@ let main () =
   let root = Unix.realpath root in
   Fun.protect ~finally:(fun () -> remove root) (fun () ->
     let binary_dir, binary = check_install root in
-    copy Sys.executable_name (binary_dir / "codex");
+    List.iter (fun cli -> copy Sys.executable_name (binary_dir / cli)) ["codex"; "claude"];
     List.iter (check_shell root binary_dir binary) shells;
-    print_endline "Integration checks passed (OCaml fake Codex; no authentication isolation claim).")
+    print_endline "Integration checks passed (OCaml fake CLIs; no authentication isolation claim).")
 
 let () =
   Printexc.record_backtrace true;
   try
-    if Filename.basename Sys.argv.(0) = "codex" then fake_codex () else main ()
+    if List.mem (Filename.basename Sys.argv.(0)) ["codex"; "claude"] then fake_cli () else main ()
   with exn ->
     prerr_endline (Printexc.to_string exn);
     prerr_string (Printexc.get_backtrace ());

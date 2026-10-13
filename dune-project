@@ -4,5 +4,5 @@
 
 (package
  (name mantle)
- (synopsis "Switch Codex subscription contexts in your shell")
+ (synopsis "Switch Codex and Claude Code subscription contexts in your shell")
  (depends (ocaml (>= 4.14)) dune))
